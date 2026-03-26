@@ -16,6 +16,14 @@ if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI || !GOOGL
 }
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
+const ALLOWED_ORDER_BY = new Set([
+  "folder,name",
+  "name",
+  "modifiedTime desc",
+  "modifiedTime",
+  "createdTime desc",
+  "createdTime",
+]);
 
 function getAuth() {
   const auth = new google.auth.OAuth2(
@@ -33,6 +41,12 @@ function getAuth() {
 
 function getDrive() {
   return google.drive({ version: "v3", auth: getAuth() });
+}
+
+function clampInt(value, defaultValue, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return defaultValue;
+  return Math.min(Math.max(Math.floor(n), min), max);
 }
 
 function normalizeDriveItem(file) {
@@ -64,64 +78,182 @@ function normalizeSearchTerm(value) {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function scoreNameMatch(name, query) {
+  const normalizedName = normalizeSearchTerm(name);
+  const normalizedQuery = normalizeSearchTerm(query);
+
+  if (!normalizedQuery) return 0;
+  if (normalizedName === normalizedQuery) return 100;
+  if (normalizedName.startsWith(normalizedQuery)) return 80;
+  if (normalizedName.includes(normalizedQuery)) return 60;
+
+  const tokens = normalizedQuery.match(/[a-z]+|\d+/g) || [];
+  const tokenHits = tokens.filter((t) => normalizedName.includes(t)).length;
+  if (tokenHits > 0) return 20 + tokenHits * 5;
+
+  return 0;
+}
+
+function badRequest(res, message) {
+  return res.status(400).json({
+    error: "BAD_REQUEST",
+    message,
+    statusCode: 400,
+  });
+}
+
+function mapGoogleError(error, fallbackCode, fallbackMessage) {
+  const status = error?.response?.status || error?.code || 500;
+
+  if (status === 400) {
+    return {
+      statusCode: 400,
+      error: "BAD_REQUEST",
+      message: error?.message || fallbackMessage,
+    };
+  }
+
+  if (status === 401) {
+    return {
+      statusCode: 401,
+      error: "UNAUTHORIZED",
+      message: "Autenticação Google inválida ou expirada",
+    };
+  }
+
+  if (status === 403) {
+    return {
+      statusCode: 403,
+      error: "FORBIDDEN",
+      message: "Sem permissão para aceder ao recurso no Google Drive",
+    };
+  }
+
+  if (status === 404) {
+    return {
+      statusCode: 404,
+      error: "NOT_FOUND",
+      message: "Recurso não encontrado no Google Drive",
+    };
+  }
+
+  return {
+    statusCode: 500,
+    error: fallbackCode,
+    message: fallbackMessage,
+  };
+}
+
+function handleError(res, error, fallbackCode, fallbackMessage) {
+  console.error(error);
+  const mapped = mapGoogleError(error, fallbackCode, fallbackMessage);
+  return res.status(mapped.statusCode).json(mapped);
+}
+
 async function listAllChildren(drive, parentId) {
   const results = [];
   let pageToken;
 
   do {
-    const res = await drive.files.list({
+    const response = await drive.files.list({
       q: `'${parentId}' in parents and trashed=false`,
       pageSize: 1000,
       pageToken,
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
       corpora: "allDrives",
-      fields: "nextPageToken, files(id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed)",
+      fields:
+        "nextPageToken, files(id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed)",
       orderBy: "folder,name",
     });
 
-    results.push(...(res.data.files || []));
-    pageToken = res.data.nextPageToken || undefined;
+    results.push(...(response.data.files || []));
+    pageToken = response.data.nextPageToken || undefined;
   } while (pageToken);
 
   return results;
 }
 
 async function getFileMeta(drive, fileId) {
-  const res = await drive.files.get({
+  const response = await drive.files.get({
     fileId,
     supportsAllDrives: true,
-    fields: "id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed",
+    fields:
+      "id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed",
   });
 
-  return res.data;
+  return response.data;
+}
+
+async function getRootMeta(drive) {
+  await drive.files.list({
+    q: "'root' in parents and trashed=false",
+    pageSize: 1,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: "user",
+    fields: "files(id)",
+  });
+
+  return {
+    id: "root",
+    name: "My Drive",
+    mimeType: FOLDER_MIME,
+    isFolder: true,
+    parents: [],
+    webViewLink: null,
+    webContentLink: null,
+    createdTime: null,
+    modifiedTime: null,
+    size: null,
+    trashed: false,
+    driveId: null,
+  };
 }
 
 async function listFolderPage(drive, folderId, pageSize = 100, pageToken = undefined, orderBy = "folder,name") {
-  const res = await drive.files.list({
+  const safePageSize = clampInt(pageSize, 100, 1, 1000);
+  const safeOrderBy = ALLOWED_ORDER_BY.has(orderBy) ? orderBy : "folder,name";
+
+  const response = await drive.files.list({
     q: `'${folderId}' in parents and trashed=false`,
-    pageSize,
+    pageSize: safePageSize,
     pageToken,
     supportsAllDrives: true,
     includeItemsFromAllDrives: true,
     corpora: "allDrives",
-    fields: "nextPageToken, files(id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed)",
-    orderBy,
+    fields:
+      "nextPageToken, files(id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed)",
+    orderBy: safeOrderBy,
   });
 
   return {
-    nextPageToken: res.data.nextPageToken || null,
-    files: res.data.files || [],
+    nextPageToken: response.data.nextPageToken || null,
+    files: response.data.files || [],
   };
 }
 
-async function searchDriveItems(drive, {
-  query,
-  parentId,
-  mimeType,
-  foldersOnly = false,
-  pageSize = 50,
-}) {
+async function searchWithinParentLocally(drive, parentId, query, mimeType, foldersOnly, pageSize) {
+  const children = await listAllChildren(drive, parentId);
+
+  let items = children.filter((item) => {
+    if (foldersOnly && item.mimeType !== FOLDER_MIME) return false;
+    if (!foldersOnly && mimeType && item.mimeType !== mimeType) return false;
+
+    const score = scoreNameMatch(item.name, query);
+    return score > 0;
+  });
+
+  items.sort((a, b) => {
+    const scoreDiff = scoreNameMatch(b.name, query) - scoreNameMatch(a.name, query);
+    if (scoreDiff !== 0) return scoreDiff;
+    return a.name.localeCompare(b.name, "pt");
+  });
+
+  return items.slice(0, clampInt(pageSize, 50, 1, 1000));
+}
+
+async function searchGloballyViaApi(drive, { query, parentId, mimeType, foldersOnly, pageSize }) {
   const conditions = ["trashed=false"];
 
   if (query) {
@@ -141,48 +273,49 @@ async function searchDriveItems(drive, {
 
   const q = conditions.join(" and ");
 
-  const res = await drive.files.list({
+  const response = await drive.files.list({
     q,
-    pageSize,
+    pageSize: clampInt(pageSize, 50, 1, 1000),
     supportsAllDrives: true,
     includeItemsFromAllDrives: true,
-    corpora: parentId ? "allDrives" : "allDrives",
-    fields: "files(id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed)",
+    corpora: "allDrives",
+    fields:
+      "files(id,name,mimeType,parents,driveId,webViewLink,webContentLink,createdTime,modifiedTime,size,trashed)",
     orderBy: "folder,name",
   });
 
-  let items = res.data.files || [];
+  const items = response.data.files || [];
 
-  if (query) {
-    const normalizedQuery = normalizeSearchTerm(query);
-    items = items.sort((a, b) => {
-      const an = normalizeSearchTerm(a.name);
-      const bn = normalizeSearchTerm(b.name);
-
-      const aExact = an === normalizedQuery ? 1 : 0;
-      const bExact = bn === normalizedQuery ? 1 : 0;
-      if (aExact !== bExact) return bExact - aExact;
-
-      const aStarts = an.startsWith(normalizedQuery) ? 1 : 0;
-      const bStarts = bn.startsWith(normalizedQuery) ? 1 : 0;
-      if (aStarts !== bStarts) return bStarts - aStarts;
-
-      const aIncludes = an.includes(normalizedQuery) ? 1 : 0;
-      const bIncludes = bn.includes(normalizedQuery) ? 1 : 0;
-      if (aIncludes !== bIncludes) return bIncludes - aIncludes;
-
-      return a.name.localeCompare(b.name, "pt");
-    });
-  }
+  items.sort((a, b) => {
+    const scoreDiff = scoreNameMatch(b.name, query) - scoreNameMatch(a.name, query);
+    if (scoreDiff !== 0) return scoreDiff;
+    return a.name.localeCompare(b.name, "pt");
+  });
 
   return items;
 }
 
-async function buildTree(drive, rootId, maxDepth = 5, depth = 0) {
-  const meta = await getFileMeta(drive, rootId);
+async function searchDriveItems(drive, { query, parentId, mimeType, foldersOnly = false, pageSize = 50 }) {
+  if (parentId) {
+    return searchWithinParentLocally(drive, parentId, query, mimeType, foldersOnly, pageSize);
+  }
+
+  return searchGloballyViaApi(drive, { query, parentId, mimeType, foldersOnly, pageSize });
+}
+
+async function buildTree(drive, rootId, maxDepth = 5, depth = 0, visited = new Set()) {
+  if (visited.has(rootId)) {
+    return null;
+  }
+
+  visited.add(rootId);
+
+  const meta = rootId === "root"
+    ? await getRootMeta(drive)
+    : normalizeDriveItem(await getFileMeta(drive, rootId));
 
   if (depth >= maxDepth || meta.mimeType !== FOLDER_MIME) {
-    return { ...normalizeDriveItem(meta), children: [] };
+    return { ...meta, children: [] };
   }
 
   const children = await listAllChildren(drive, rootId);
@@ -190,13 +323,14 @@ async function buildTree(drive, rootId, maxDepth = 5, depth = 0) {
 
   for (const child of children) {
     if (child.mimeType === FOLDER_MIME) {
-      mapped.push(await buildTree(drive, child.id, maxDepth, depth + 1));
+      const subtree = await buildTree(drive, child.id, maxDepth, depth + 1, visited);
+      if (subtree) mapped.push(subtree);
     } else {
       mapped.push({ ...normalizeDriveItem(child), children: [] });
     }
   }
 
-  return { ...normalizeDriveItem(meta), children: mapped };
+  return { ...meta, children: mapped };
 }
 
 function flattenTree(node, currentPath = "", depth = 0, parentId = null) {
@@ -231,6 +365,25 @@ async function getPathSegments(drive, fileId) {
 
   while (currentId && !visited.has(currentId)) {
     visited.add(currentId);
+
+    if (currentId === "root") {
+      segments.unshift({
+        id: "root",
+        name: "My Drive",
+        mimeType: FOLDER_MIME,
+        isFolder: true,
+        parents: [],
+        webViewLink: null,
+        webContentLink: null,
+        createdTime: null,
+        modifiedTime: null,
+        size: null,
+        trashed: false,
+        driveId: null,
+      });
+      break;
+    }
+
     const meta = await getFileMeta(drive, currentId);
     const normalized = normalizeDriveItem(meta);
     segments.unshift(normalized);
@@ -254,16 +407,10 @@ app.get("/health", async (_req, res) => {
 app.get("/reb/drive/root", async (_req, res) => {
   try {
     const drive = getDrive();
-    const meta = await getFileMeta(drive, "root");
-
-    res.json(normalizeDriveItem(meta));
+    const root = await getRootMeta(drive);
+    return res.json(root);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "ROOT_ERROR",
-      message: "Erro ao obter a raiz do Drive",
-      statusCode: 500,
-    });
+    return handleError(res, error, "ROOT_ERROR", "Erro ao obter a raiz do Drive");
   }
 });
 
@@ -273,22 +420,18 @@ app.get("/reb/drive/file", async (req, res) => {
     const fileId = String(req.query.fileId || "").trim();
 
     if (!fileId) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "fileId é obrigatório",
-        statusCode: 400,
-      });
+      return badRequest(res, "fileId é obrigatório");
+    }
+
+    if (fileId === "root") {
+      const root = await getRootMeta(drive);
+      return res.json(root);
     }
 
     const meta = await getFileMeta(drive, fileId);
-    res.json(normalizeDriveItem(meta));
+    return res.json(normalizeDriveItem(meta));
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "FILE_META_ERROR",
-      message: "Erro ao obter metadados do ficheiro",
-      statusCode: 500,
-    });
+    return handleError(res, error, "FILE_META_ERROR", "Erro ao obter metadados do ficheiro");
   }
 });
 
@@ -296,34 +439,32 @@ app.get("/reb/drive/list", async (req, res) => {
   try {
     const drive = getDrive();
     const folderId = String(req.query.folderId || "").trim();
-    const pageSize = Number(req.query.pageSize || 100);
+    const pageSize = clampInt(req.query.pageSize || 100, 100, 1, 1000);
     const pageToken = req.query.pageToken ? String(req.query.pageToken) : undefined;
     const orderBy = String(req.query.orderBy || "folder,name");
 
     if (!folderId) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "folderId é obrigatório",
-        statusCode: 400,
-      });
+      return badRequest(res, "folderId é obrigatório");
     }
 
-    const folderMeta = await getFileMeta(drive, folderId);
+    const folderMeta = folderId === "root"
+      ? await getRootMeta(drive)
+      : normalizeDriveItem(await getFileMeta(drive, folderId));
+
+    if (!folderMeta.isFolder) {
+      return badRequest(res, "folderId não corresponde a uma pasta");
+    }
+
     const page = await listFolderPage(drive, folderId, pageSize, pageToken, orderBy);
 
-    res.json({
+    return res.json({
       folderId,
       folderName: folderMeta.name,
       items: page.files.map(normalizeDriveItem),
       nextPageToken: page.nextPageToken,
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "LIST_ERROR",
-      message: "Erro ao listar conteúdo da pasta",
-      statusCode: 500,
-    });
+    return handleError(res, error, "LIST_ERROR", "Erro ao listar conteúdo da pasta");
   }
 });
 
@@ -334,14 +475,17 @@ app.get("/reb/drive/search", async (req, res) => {
     const parentId = req.query.parentId ? String(req.query.parentId).trim() : null;
     const mimeType = req.query.mimeType ? String(req.query.mimeType).trim() : null;
     const foldersOnly = String(req.query.foldersOnly || "false").toLowerCase() === "true";
-    const pageSize = Number(req.query.pageSize || 50);
+    const pageSize = clampInt(req.query.pageSize || 50, 50, 1, 1000);
 
     if (!query) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "query é obrigatório",
-        statusCode: 400,
-      });
+      return badRequest(res, "query é obrigatório");
+    }
+
+    if (parentId && parentId !== "root") {
+      const parentMeta = normalizeDriveItem(await getFileMeta(drive, parentId));
+      if (!parentMeta.isFolder) {
+        return badRequest(res, "parentId não corresponde a uma pasta");
+      }
     }
 
     const items = await searchDriveItems(drive, {
@@ -352,18 +496,13 @@ app.get("/reb/drive/search", async (req, res) => {
       pageSize,
     });
 
-    res.json({
+    return res.json({
       query,
       parentId,
       items: items.map(normalizeDriveItem),
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "SEARCH_ERROR",
-      message: "Erro na pesquisa do Drive",
-      statusCode: 500,
-    });
+    return handleError(res, error, "SEARCH_ERROR", "Erro na pesquisa do Drive");
   }
 });
 
@@ -373,10 +512,13 @@ app.get("/reb/drive/parents", async (req, res) => {
     const fileId = String(req.query.fileId || "").trim();
 
     if (!fileId) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "fileId é obrigatório",
-        statusCode: 400,
+      return badRequest(res, "fileId é obrigatório");
+    }
+
+    if (fileId === "root") {
+      return res.json({
+        fileId,
+        parents: [],
       });
     }
 
@@ -385,21 +527,20 @@ app.get("/reb/drive/parents", async (req, res) => {
     const parents = [];
 
     for (const parentId of parentIds) {
-      const parentMeta = await getFileMeta(drive, parentId);
-      parents.push(normalizeDriveItem(parentMeta));
+      if (parentId === "root") {
+        parents.push(await getRootMeta(drive));
+      } else {
+        const parentMeta = await getFileMeta(drive, parentId);
+        parents.push(normalizeDriveItem(parentMeta));
+      }
     }
 
-    res.json({
+    return res.json({
       fileId,
       parents,
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "PARENTS_ERROR",
-      message: "Erro ao obter parents do item",
-      statusCode: 500,
-    });
+    return handleError(res, error, "PARENTS_ERROR", "Erro ao obter parents do item");
   }
 });
 
@@ -409,28 +550,19 @@ app.get("/reb/drive/path", async (req, res) => {
     const fileId = String(req.query.fileId || "").trim();
 
     if (!fileId) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "fileId é obrigatório",
-        statusCode: 400,
-      });
+      return badRequest(res, "fileId é obrigatório");
     }
 
     const segments = await getPathSegments(drive, fileId);
-    const path = segments.map((s) => s.name).join(" > ");
+    const path = segments.map((segment) => segment.name).join(" > ");
 
-    res.json({
+    return res.json({
       fileId,
       path,
       segments,
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "PATH_ERROR",
-      message: "Erro ao reconstruir caminho do item",
-      statusCode: 500,
-    });
+    return handleError(res, error, "PATH_ERROR", "Erro ao reconstruir caminho do item");
   }
 });
 
@@ -438,32 +570,32 @@ app.get("/reb/drive/tree", async (req, res) => {
   try {
     const drive = getDrive();
     const rootId = String(req.query.rootId || "").trim();
-    const maxDepth = Number(req.query.maxDepth || 5);
+    const maxDepth = clampInt(req.query.maxDepth || 5, 5, 1, 20);
 
     if (!rootId) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "rootId é obrigatório",
-        statusCode: 400,
-      });
+      return badRequest(res, "rootId é obrigatório");
     }
 
     const tree = await buildTree(drive, rootId, maxDepth);
+    if (!tree) {
+      return res.json({
+        rootId,
+        rootName: null,
+        maxDepth,
+        nodes: [],
+      });
+    }
+
     const nodes = flattenTree(tree);
 
-    res.json({
+    return res.json({
       rootId,
       rootName: tree.name,
       maxDepth,
       nodes,
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "TREE_ERROR",
-      message: "Erro ao gerar árvore do Drive",
-      statusCode: 500,
-    });
+    return handleError(res, error, "TREE_ERROR", "Erro ao gerar árvore do Drive");
   }
 });
 
@@ -471,35 +603,38 @@ app.get("/reb/drive/index", async (req, res) => {
   try {
     const drive = getDrive();
     const rootId = String(req.query.rootId || "").trim();
-    const maxDepth = Number(req.query.maxDepth || 5);
+    const maxDepth = clampInt(req.query.maxDepth || 5, 5, 1, 20);
 
     if (!rootId) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "rootId é obrigatório",
-        statusCode: 400,
-      });
+      return badRequest(res, "rootId é obrigatório");
     }
 
     const tree = await buildTree(drive, rootId, maxDepth);
+    if (!tree) {
+      return res.json({
+        scannedAt: new Date().toISOString(),
+        rootId,
+        maxDepth,
+        totalItems: 0,
+        totalFolders: 0,
+        totalFiles: 0,
+        items: [],
+      });
+    }
+
     const items = flattenTree(tree);
 
-    res.json({
+    return res.json({
       scannedAt: new Date().toISOString(),
       rootId,
       maxDepth,
       totalItems: items.length,
-      totalFolders: items.filter((i) => i.isFolder).length,
-      totalFiles: items.filter((i) => !i.isFolder).length,
+      totalFolders: items.filter((item) => item.isFolder).length,
+      totalFiles: items.filter((item) => !item.isFolder).length,
       items,
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "INDEX_ERROR",
-      message: "Erro ao gerar índice do Drive",
-      statusCode: 500,
-    });
+    return handleError(res, error, "INDEX_ERROR", "Erro ao gerar índice do Drive");
   }
 });
 
@@ -509,11 +644,11 @@ app.get("/reb/drive/download", async (req, res) => {
     const fileId = String(req.query.fileId || "").trim();
 
     if (!fileId) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "fileId é obrigatório",
-        statusCode: 400,
-      });
+      return badRequest(res, "fileId é obrigatório");
+    }
+
+    if (fileId === "root") {
+      return badRequest(res, "Não é possível fazer download da raiz do Drive");
     }
 
     const meta = await getFileMeta(drive, fileId);
@@ -534,14 +669,10 @@ app.get("/reb/drive/download", async (req, res) => {
 
     res.setHeader("Content-Disposition", `inline; filename="${meta.name}"`);
     if (meta.mimeType) res.setHeader("Content-Type", meta.mimeType);
+
     response.data.pipe(res);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "DOWNLOAD_ERROR",
-      message: "Erro no download do ficheiro",
-      statusCode: 500,
-    });
+    return handleError(res, error, "DOWNLOAD_ERROR", "Erro no download do ficheiro");
   }
 });
 
@@ -552,11 +683,11 @@ app.get("/reb/drive/export", async (req, res) => {
     const mimeType = String(req.query.mimeType || "").trim();
 
     if (!fileId || !mimeType) {
-      return res.status(400).json({
-        error: "BAD_REQUEST",
-        message: "fileId e mimeType são obrigatórios",
-        statusCode: 400,
-      });
+      return badRequest(res, "fileId e mimeType são obrigatórios");
+    }
+
+    if (fileId === "root") {
+      return badRequest(res, "Não é possível exportar a raiz do Drive");
     }
 
     const response = await drive.files.export(
@@ -567,12 +698,7 @@ app.get("/reb/drive/export", async (req, res) => {
     res.setHeader("Content-Type", mimeType);
     response.data.pipe(res);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "EXPORT_ERROR",
-      message: "Erro a exportar ficheiro Google Workspace",
-      statusCode: 500,
-    });
+    return handleError(res, error, "EXPORT_ERROR", "Erro a exportar ficheiro Google Workspace");
   }
 });
 
